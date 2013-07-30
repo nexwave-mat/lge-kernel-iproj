@@ -2,7 +2,7 @@
  *
  * MSM MDP Interface (used by framebuffer core)
  *
- * Copyright (c) 2007-2012, Code Aurora Forum. All rights reserved.
+ * Copyright (c) 2007-2013, Code Aurora Forum. All rights reserved.
  * Copyright (C) 2007 Google Incorporated
  *
  * This software is licensed under the terms of the GNU General Public
@@ -35,6 +35,7 @@
 #include <asm/mach-types.h>
 #include <linux/semaphore.h>
 #include <linux/uaccess.h>
+#include <mach/event_timer.h>
 #include <mach/clk.h>
 #include "mdp.h"
 #include "msm_fb.h"
@@ -504,7 +505,9 @@ static int mdp_lut_update_nonlcdc(struct fb_info *info, struct fb_cmap *cmap)
 	int ret;
 
 	mdp_pipe_ctrl(MDP_CMD_BLOCK, MDP_BLOCK_POWER_ON, FALSE);
+	mdp_clk_ctrl(1);
 	ret = mdp_lut_hw_update(cmap);
+	mdp_clk_ctrl(0);
 	mdp_pipe_ctrl(MDP_CMD_BLOCK, MDP_BLOCK_POWER_OFF, FALSE);
 
 	if (ret)
@@ -526,9 +529,11 @@ static int mdp_lut_update_lcdc(struct fb_info *info, struct fb_cmap *cmap)
 	uint32_t out;
 
 	mdp_pipe_ctrl(MDP_CMD_BLOCK, MDP_BLOCK_POWER_ON, FALSE);
+	mdp_clk_ctrl(1);
 	ret = mdp_lut_hw_update(cmap);
 
 	if (ret) {
+		mdp_clk_ctrl(0);
 		mdp_pipe_ctrl(MDP_CMD_BLOCK, MDP_BLOCK_POWER_OFF, FALSE);
 		return ret;
 	}
@@ -536,6 +541,7 @@ static int mdp_lut_update_lcdc(struct fb_info *info, struct fb_cmap *cmap)
 	/*mask off non LUT select bits*/
 	out = inpdw(MDP_BASE + 0x90070) & ~((0x1 << 10) | 0x7);
 	MDP_OUTP(MDP_BASE + 0x90070, (mdp_lut_i << 10) | 0x7 | out);
+	mdp_clk_ctrl(0);
 	mdp_pipe_ctrl(MDP_CMD_BLOCK, MDP_BLOCK_POWER_OFF, FALSE);
 	mdp_lut_i = (mdp_lut_i + 1)%2;
 
@@ -833,12 +839,10 @@ int _mdp_histogram_ctrl(boolean en, struct mdp_hist_mgmt *mgmt)
 	int ret = 0;
 
 	mutex_lock(&mgmt->mdp_hist_mutex);
-	if (mgmt->mdp_is_hist_start == TRUE) {
-		if (en)
-			ret = mdp_histogram_enable(mgmt);
-		else
-			ret = mdp_histogram_disable(mgmt);
-	}
+	if (mgmt->mdp_is_hist_start && !mgmt->mdp_is_hist_data && en)
+		ret = mdp_histogram_enable(mgmt);
+	else if (mgmt->mdp_is_hist_data && !en)
+		ret = mdp_histogram_disable(mgmt);
 	mutex_unlock(&mgmt->mdp_hist_mutex);
 
 	if (en == false)
@@ -933,8 +937,10 @@ int mdp_histogram_stop(struct fb_info *info, uint32_t block)
 	mgmt->mdp_is_hist_start = FALSE;
 
 	if (!mfd->panel_power_on) {
-		mgmt->mdp_is_hist_data = FALSE;
-		complete(&mgmt->mdp_hist_comp);
+		if (mgmt->hist != NULL) {
+			mgmt->hist = NULL;
+			complete(&mgmt->mdp_hist_comp);
+		}
 		ret = -EINVAL;
 		goto error_lock;
 	}
@@ -985,6 +991,7 @@ static int _mdp_histogram_read_dma_data(struct mdp_hist_mgmt *mgmt)
 	}
 
 	mdp_pipe_ctrl(MDP_CMD_BLOCK, MDP_BLOCK_POWER_ON, FALSE);
+	mdp_clk_ctrl(1);
 	for (i = 0; i < mgmt->num_bins; i++) {
 		mgmt->c0[i] = inpdw(mdp_hist_base + r_data_offset + (4*i));
 		mgmt->c1[i] = inpdw(mdp_hist_base + g_data_offset + (4*i));
@@ -1000,6 +1007,7 @@ static int _mdp_histogram_read_dma_data(struct mdp_hist_mgmt *mgmt)
 		} else
 			ret = -ENOMEM;
 	}
+	mdp_clk_ctrl(0);
 	mdp_pipe_ctrl(MDP_CMD_BLOCK, MDP_BLOCK_POWER_OFF, FALSE);
 
 	if (!ret)
@@ -1035,6 +1043,7 @@ static int _mdp_histogram_read_vg_data(struct mdp_hist_mgmt *mgmt)
 	}
 
 	mdp_pipe_ctrl(MDP_CMD_BLOCK, MDP_BLOCK_POWER_ON, FALSE);
+	mdp_clk_ctrl(1);
 	for (i = 0; i < mgmt->num_bins; i++)
 		mgmt->c0[i] = inpdw(mdp_hist_base + MDP_HIST_DATA_LUMA_OFF +
 									(4*i));
@@ -1046,6 +1055,7 @@ static int _mdp_histogram_read_vg_data(struct mdp_hist_mgmt *mgmt)
 		} else
 			ret = -ENOMEM;
 	}
+	mdp_clk_ctrl(0);
 	mdp_pipe_ctrl(MDP_CMD_BLOCK, MDP_BLOCK_POWER_OFF, FALSE);
 
 	if (!ret)
@@ -1227,20 +1237,105 @@ static void vsync_isr_handler(void)
 int mdp_ppp_pipe_wait(void)
 {
 	int ret = 1;
+	boolean wait;
+	unsigned long flag;
 
 	/* wait 5 seconds for the operation to complete before declaring
 	the MDP hung */
+	spin_lock_irqsave(&mdp_spin_lock, flag);
+	wait = mdp_ppp_waiting;
+	spin_unlock_irqrestore(&mdp_spin_lock, flag);
 
-	if (mdp_ppp_waiting == TRUE) {
+	if (wait == TRUE) {
 		ret = wait_for_completion_interruptible_timeout(&mdp_ppp_comp,
 								5 * HZ);
-
 		if (!ret)
 			printk(KERN_ERR "%s: Timed out waiting for the MDP.\n",
-					__func__);
+				__func__);
 	}
 
 	return ret;
+}
+
+#define MAX_VSYNC_GAP		4
+#define DEFAULT_FRAME_RATE	60
+
+static u32 mdp_get_panel_framerate(struct msm_fb_data_type *mfd)
+{
+	u32 frame_rate = 0, total_pixel;
+	struct msm_panel_info *panel_info = &mfd->panel_info;
+	if (mfd->dest == DISPLAY_LCD) {
+		if (panel_info->type == MDDI_PANEL && panel_info->mddi.is_type1)
+			frame_rate = panel_info->lcd.refx100 / (100 * 2);
+		else
+			frame_rate = panel_info->lcd.refx100 / 100;
+	} else {
+		if (panel_info->type == MIPI_VIDEO_PANEL) {
+			frame_rate = panel_info->mipi.frame_rate;
+		} else {
+			total_pixel = (panel_info->lcdc.h_back_porch +
+				  panel_info->lcdc.h_front_porch +
+				  panel_info->lcdc.h_pulse_width +
+				  panel_info->xres) *
+				 (panel_info->lcdc.v_back_porch +
+				  panel_info->lcdc.v_front_porch +
+				  panel_info->lcdc.v_pulse_width +
+				  panel_info->yres);
+			if (total_pixel)
+				frame_rate = panel_info->clk_rate /
+					total_pixel;
+		}
+	}
+	if (frame_rate == 0)
+		frame_rate = DEFAULT_FRAME_RATE;
+	return frame_rate;
+}
+
+static int mdp_diff_to_next_vsync(ktime_t cur_time,
+			ktime_t last_vsync, u32 vsync_period)
+{
+	int diff_from_last, diff_to_next;
+	/*
+	 * Get interval beween last vsync and current time
+	 * Current time = CPU programming MDP for next Vsync
+	 */
+	diff_from_last =
+		(ktime_to_us(ktime_sub(cur_time, last_vsync)));
+	diff_from_last /= USEC_PER_MSEC;
+	/*
+	 * If the last Vsync occurred too long ago, skip programming
+	 * the timer
+	 */
+	if (diff_from_last < (vsync_period * MAX_VSYNC_GAP)) {
+		if (diff_from_last > vsync_period)
+			diff_to_next =
+				(diff_from_last - vsync_period) % vsync_period;
+		else
+			diff_to_next = vsync_period - diff_from_last;
+	} else {
+		/* mark it out of range */
+		diff_to_next = vsync_period + 1;
+	}
+	return diff_to_next;
+}
+
+void mdp_update_pm(struct msm_fb_data_type *mfd, ktime_t pre_vsync)
+{
+	u32 vsync_period;
+	int diff_to_next;
+	ktime_t cur_time, wakeup_time;
+
+	if (!mfd->cpu_pm_hdl)
+		return;
+	vsync_period = mfd->panel_info.frame_interval;
+	cur_time = ktime_get();
+	diff_to_next = mdp_diff_to_next_vsync(cur_time,
+					      pre_vsync,
+					      vsync_period);
+	if (diff_to_next > vsync_period)
+		return;
+	wakeup_time = ktime_add_ns(cur_time, diff_to_next * NSEC_PER_MSEC);
+	activate_event_timer(mfd->cpu_pm_hdl, wakeup_time);
 }
 
 static DEFINE_SPINLOCK(mdp_lock);
@@ -1307,6 +1402,7 @@ void mdp_disable_irq_nosync(uint32 term)
 
 void mdp_pipe_kickoff(uint32 term, struct msm_fb_data_type *mfd)
 {
+	unsigned long flag;
 	/* complete all the writes before starting */
 	wmb();
 
@@ -1320,7 +1416,9 @@ void mdp_pipe_kickoff(uint32 term, struct msm_fb_data_type *mfd)
 
 		mdp_enable_irq(term);
 		INIT_COMPLETION(mdp_ppp_comp);
+		spin_lock_irqsave(&mdp_spin_lock, flag);
 		mdp_ppp_waiting = TRUE;
+		spin_unlock_irqrestore(&mdp_spin_lock, flag);
 		outpdw(MDP_BASE + 0x30, 0x1000);
 		wait_for_completion_killable(&mdp_ppp_comp);
 		mdp_disable_irq(term);
@@ -2036,6 +2134,7 @@ static int mdp_on(struct platform_device *pdev)
 		}
 
 		mdp_clk_ctrl(0);
+		mdp4_overlay_reset();
 		mdp_pipe_ctrl(MDP_CMD_BLOCK, MDP_BLOCK_POWER_OFF, FALSE);
 	}
 
@@ -2225,6 +2324,7 @@ static int mdp_probe(struct platform_device *pdev)
 	int rc;
 	resource_size_t  size ;
 	unsigned long flag;
+	u32 frame_rate;
 #ifdef CONFIG_FB_MSM_MDP40
 	int intf, if_no;
 #endif
@@ -2448,6 +2548,7 @@ static int mdp_probe(struct platform_device *pdev)
 		else {
 			printk(KERN_ERR "Invalid Selection of destination panel\n");
 			rc = -ENODEV;
+			mdp_clk_ctrl(0);
 			goto mdp_probe_err;
 		}
 
@@ -2482,6 +2583,7 @@ static int mdp_probe(struct platform_device *pdev)
 		else {
 			printk(KERN_ERR "Invalid Selection of destination panel\n");
 			rc = -ENODEV;
+			mdp_clk_ctrl(0);
 			goto mdp_probe_err;
 		}
 		INIT_WORK(&mfd->dma_update_worker,
@@ -2574,6 +2676,7 @@ static int mdp_probe(struct platform_device *pdev)
 				pr_err("%s: writeback panel not supprted\n",
 					 __func__);
 				platform_device_put(msm_fb_dev);
+				mdp_clk_ctrl(0);
 				return -ENODEV;
 			}
 			pdata->on = mdp4_overlay_writeback_on;
@@ -2596,6 +2699,11 @@ static int mdp_probe(struct platform_device *pdev)
 	mdp_pipe_ctrl(MDP_CMD_BLOCK, MDP_BLOCK_POWER_OFF, FALSE);
 #endif
 
+	frame_rate = mdp_get_panel_framerate(mfd);
+	if (frame_rate) {
+		mfd->panel_info.frame_interval = 1000 / frame_rate;
+		mfd->cpu_pm_hdl = add_event_timer(NULL, (void *)mfd);
+	}
 	mdp_clk_ctrl(0);
 
 #ifdef CONFIG_MSM_BUS_SCALING

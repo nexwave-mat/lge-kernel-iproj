@@ -1145,11 +1145,12 @@ void mdp4_dsi_video_overlay(struct msm_fb_data_type *mfd)
 		mdp4_dsi_video_pipe_queue(0, pipe);
 	}
 
-	mutex_lock(&mfd->dma->ov_mutex);
+	mdp_update_pm(mfd, vsync_ctrl_db[0].vsync_time);
 	mdp4_overlay_mdp_perf_upd(mfd, 1);
 
+	mutex_lock(&mfd->dma->ov_mutex);
+
 	cnt = mdp4_dsi_video_pipe_commit(cndx, 0);
-	mutex_unlock(&mfd->dma->ov_mutex);
 
 	if (cnt) {
 		if (pipe->ov_blt_addr)
@@ -1159,5 +1160,6 @@ void mdp4_dsi_video_overlay(struct msm_fb_data_type *mfd)
 	}
 
 	mdp4_overlay_mdp_perf_upd(mfd, 0);
+	mutex_unlock(&mfd->dma->ov_mutex);
 }
 
